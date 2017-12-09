@@ -11,10 +11,19 @@ import (
 	"testing"
 
 	_ "github.com/anacrolix/envpprof"
-
 	"github.com/bradfitz/iter"
 	"github.com/stretchr/testify/require"
 )
+
+func sliceIter(skeys [][]byte) SecretKeyIter {
+	return func(callback func([]byte) bool) {
+		for _, sk := range skeys {
+			if !callback(sk) {
+				break
+			}
+		}
+	}
+}
 
 func TestReadUntil(t *testing.T) {
 	test := func(data, until string, leftover int, expectedErr error) {

@@ -14,14 +14,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anacrolix/torrent/mse"
-
 	"github.com/anacrolix/missinggo"
 	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/anacrolix/missinggo/iter"
 	"github.com/anacrolix/missinggo/prioritybitmap"
 
 	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/mse"
 	pp "github.com/anacrolix/torrent/peer_protocol"
 )
 
@@ -145,7 +144,7 @@ func eventAgeString(t time.Time) string {
 	if t.IsZero() {
 		return "never"
 	}
-	return fmt.Sprintf("%.2fs ago", time.Now().Sub(t).Seconds())
+	return fmt.Sprintf("%.2fs ago", time.Since(t).Seconds())
 }
 
 func (cn *connection) connectionFlags() (ret string) {
@@ -335,6 +334,29 @@ func (cn *connection) SetInterested(interested bool, msg func(pp.Message) bool) 
 	})
 }
 
+// The function takes a message to be sent, and returns true if more messages
+// are okay.
+type messageWriter func(pp.Message) bool
+
+func (cn *connection) request(r request, mw messageWriter) bool {
+	if cn.requests == nil {
+		cn.requests = make(map[request]struct{}, cn.nominalMaxRequests())
+	}
+	if _, ok := cn.requests[r]; ok {
+		panic("chunk already requested")
+	}
+	if !cn.PeerHasPiece(r.Index.Int()) {
+		panic("requesting piece peer doesn't have")
+	}
+	cn.requests[r] = struct{}{}
+	return mw(pp.Message{
+		Type:   pp.Request,
+		Index:  r.Index,
+		Begin:  r.Begin,
+		Length: r.Length,
+	})
+}
+
 func (cn *connection) fillWriteBuffer(msg func(pp.Message) bool) {
 	numFillBuffers.Add(1)
 	cancel, new, i := cn.desiredRequestState()
@@ -354,29 +376,21 @@ func (cn *connection) fillWriteBuffer(msg func(pp.Message) bool) {
 	if len(new) != 0 {
 		fillBufferSentRequests.Add(1)
 		for _, r := range new {
-			if cn.requests == nil {
-				cn.requests = make(map[request]struct{}, cn.nominalMaxRequests())
-			}
-			cn.requests[r] = struct{}{}
-			// log.Printf("%p: requesting %v", cn, r)
-			if !msg(pp.Message{
-				Type:   pp.Request,
-				Index:  r.Index,
-				Begin:  r.Begin,
-				Length: r.Length,
-			}) {
+			if !cn.request(r, msg) {
+				// If we didn't completely top up the requests, we shouldn't
+				// mark the low water, since we'll want to top up the requests
+				// as soon as we have more write buffer space.
 				return
 			}
 		}
-		// If we didn't completely top up the requests, we shouldn't mark the
-		// low water, since we'll want to top up the requests as soon as we
-		// have more write buffer space.
 		cn.requestsLowWater = len(cn.requests) / 2
 	}
 	cn.upload(msg)
 }
 
-// Writes buffers to the socket from the write channel.
+// Routine that writes to the peer. Some of what to write is buffered by
+// activity elsewhere in the Client, and some is determined locally when the
+// connection is writable.
 func (cn *connection) writer(keepAliveTimeout time.Duration) {
 	var (
 		buf       bytes.Buffer
@@ -410,6 +424,7 @@ func (cn *connection) writer(keepAliveTimeout time.Duration) {
 			postedKeepalives.Add(1)
 		}
 		if buf.Len() == 0 {
+			// TODO: Minimize wakeups....
 			cn.writerCond.Wait()
 			continue
 		}
@@ -502,6 +517,9 @@ func (cn *connection) updateRequests() {
 	cn.tickleWriter()
 }
 
+// Emits the indices in the Bitmaps bms in order, never repeating any index.
+// skip is mutated during execution, and its initial values will never be
+// emitted.
 func iterBitmapsDistinct(skip bitmap.Bitmap, bms ...bitmap.Bitmap) iter.Func {
 	return func(cb iter.Callback) {
 		for _, bm := range bms {
@@ -517,7 +535,13 @@ func iterBitmapsDistinct(skip bitmap.Bitmap, bms ...bitmap.Bitmap) iter.Func {
 
 func (cn *connection) unbiasedPieceRequestOrder() iter.Func {
 	now, readahead := cn.t.readerPiecePriorities()
-	return iterBitmapsDistinct(cn.t.completedPieces.Copy(), now, readahead, cn.t.pendingPieces)
+	// Pieces to skip include pieces the peer doesn't have
+	skip := bitmap.Flip(cn.peerPieces, 0, cn.t.numPieces())
+	// And pieces that we already have.
+	skip.Union(cn.t.completedPieces)
+	// Return an iterator over the different priority classes, minus the skip
+	// pieces.
+	return iterBitmapsDistinct(skip, now, readahead, cn.t.pendingPieces)
 }
 
 // The connection should download highest priority pieces first, without any
@@ -822,6 +846,15 @@ func (c *connection) mainReadLoop() error {
 				break
 			}
 			if len(c.PeerRequests) >= maxRequests {
+				// TODO: Should we drop them or Choke them instead?
+				break
+			}
+			if !t.havePiece(msg.Index.Int()) {
+				// This isn't necessarily them screwing up. We can drop pieces
+				// from our storage, and can't communicate this to peers
+				// except by reconnecting.
+				requestsReceivedForMissingPieces.Add(1)
+				err = fmt.Errorf("peer requested piece we don't have: %v", msg.Index.Int())
 				break
 			}
 			if c.PeerRequests == nil {
@@ -843,7 +876,7 @@ func (c *connection) mainReadLoop() error {
 		case pp.Piece:
 			c.receiveChunk(&msg)
 			if len(msg.Piece) == int(t.chunkSize) {
-				t.chunkPool.Put(msg.Piece)
+				t.chunkPool.Put(&msg.Piece)
 			}
 		case pp.Extended:
 			switch msg.ExtendedID {
@@ -864,32 +897,29 @@ func (c *connection) mainReadLoop() error {
 				if v, ok := d["v"]; ok {
 					c.PeerClientName = v.(string)
 				}
-				m, ok := d["m"]
-				if !ok {
-					err = errors.New("handshake missing m item")
-					break
-				}
-				mTyped, ok := m.(map[string]interface{})
-				if !ok {
-					err = errors.New("handshake m value is not dict")
-					break
-				}
-				if c.PeerExtensionIDs == nil {
-					c.PeerExtensionIDs = make(map[string]byte, len(mTyped))
-				}
-				for name, v := range mTyped {
-					id, ok := v.(int64)
+				if m, ok := d["m"]; ok {
+					mTyped, ok := m.(map[string]interface{})
 					if !ok {
-						log.Printf("bad handshake m item extension ID type: %T", v)
-						continue
+						err = errors.New("handshake m value is not dict")
+						break
 					}
-					if id == 0 {
-						delete(c.PeerExtensionIDs, name)
-					} else {
-						if c.PeerExtensionIDs[name] == 0 {
-							supportedExtensionMessages.Add(name, 1)
+					if c.PeerExtensionIDs == nil {
+						c.PeerExtensionIDs = make(map[string]byte, len(mTyped))
+					}
+					for name, v := range mTyped {
+						id, ok := v.(int64)
+						if !ok {
+							log.Printf("bad handshake m item extension ID type: %T", v)
+							continue
 						}
-						c.PeerExtensionIDs[name] = byte(id)
+						if id == 0 {
+							delete(c.PeerExtensionIDs, name)
+						} else {
+							if c.PeerExtensionIDs[name] == 0 {
+								supportedExtensionMessages.Add(name, 1)
+							}
+							c.PeerExtensionIDs[name] = byte(id)
+						}
 					}
 				}
 				metadata_sizeUntyped, ok := d["metadata_size"]
@@ -1015,9 +1045,9 @@ func (c *connection) receiveChunk(msg *pp.Message) {
 
 	c.UsefulChunksReceived++
 	c.lastUsefulChunkReceived = time.Now()
-	if t.fastestConn != c {
-		// log.Printf("setting fastest connection %p", c)
-	}
+	// if t.fastestConn != c {
+	// log.Printf("setting fastest connection %p", c)
+	// }
 	t.fastestConn = c
 
 	// Need to record that it hasn't been written yet, before we attempt to do
@@ -1059,7 +1089,6 @@ func (c *connection) receiveChunk(msg *pp.Message) {
 
 	cl.event.Broadcast()
 	t.publishPieceChange(int(req.Index))
-	return
 }
 
 // Also handles choking and unchoking of the remote peer.
@@ -1088,7 +1117,7 @@ another:
 		for r := range c.PeerRequests {
 			res := cl.uploadLimit.ReserveN(time.Now(), int(r.Length))
 			if !res.OK() {
-				panic(res)
+				panic(fmt.Sprintf("upload rate limiter burst size < %d", r.Length))
 			}
 			delay := res.Delay()
 			if delay > 0 {
@@ -1153,6 +1182,7 @@ func (c *connection) deleteRequest(r request) bool {
 	delete(c.requests, r)
 	return true
 }
+
 func (c *connection) tickleWriter() {
 	c.writerCond.Broadcast()
 }
